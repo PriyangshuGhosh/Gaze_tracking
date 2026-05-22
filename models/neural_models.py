@@ -66,14 +66,12 @@ class GazeResidualCorrector(nn.Module):
                        [pupil_x, pupil_y, pupil_area, pupil_conf,
                         glint0_x, glint0_y, glint1_x, glint1_y,
                         glint2_x, glint2_y, glint3_x, glint3_y]  — all normalized [0,1]
-      - imu_feat:    (B, 6) IMU features:
-                       [roll, pitch, yaw, ω_x, ω_y, ω_z] — normalized
 
     Output:
       - delta_gaze:  (B, 2) [Δazimuth_deg, Δelevation_deg]
     """
 
-    def __init__(self, geo_dim: int = 12, imu_dim: int = 6):
+    def __init__(self, geo_dim: int = 12):
         super().__init__()
         self.patch_encoder = EyePatchEncoder()  # → 64
 
@@ -83,15 +81,9 @@ class GazeResidualCorrector(nn.Module):
             nn.Linear(32, 32),
         )
 
-        # IMU feature branch
-        self.imu_net = nn.Sequential(
-            nn.Linear(imu_dim, 16), nn.ReLU6(inplace=True),
-            nn.Linear(16, 16),
-        )
-
-        # Fusion head: 64 + 32 + 16 = 112 → 2
+        # Fusion head: 64 + 32 = 96 → 2
         self.fusion = nn.Sequential(
-            nn.Linear(112, 64), nn.ReLU6(inplace=True),
+            nn.Linear(96, 64), nn.ReLU6(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(64, 32), nn.ReLU6(inplace=True),
             nn.Linear(32, 2),  # Δazimuth, Δelevation
@@ -105,12 +97,10 @@ class GazeResidualCorrector(nn.Module):
         self,
         eye_patch: torch.Tensor,
         geo_feat: torch.Tensor,
-        imu_feat: torch.Tensor,
     ) -> torch.Tensor:
         patch_emb = self.patch_encoder(eye_patch)  # (B, 64)
         geo_emb   = self.geo_net(geo_feat)         # (B, 32)
-        imu_emb   = self.imu_net(imu_feat)         # (B, 16)
-        fused = torch.cat([patch_emb, geo_emb, imu_emb], dim=1)  # (B, 112)
+        fused = torch.cat([patch_emb, geo_emb], dim=1)  # (B, 96)
         return self.fusion(fused)  # (B, 2)
 
     def get_param_count(self) -> int:
@@ -121,11 +111,10 @@ class GazeResidualCorrector(nn.Module):
         self,
         eye_patch: torch.Tensor,
         geo_feat: torch.Tensor,
-        imu_feat: torch.Tensor,
     ) -> torch.Tensor:
         """TorchScript-compatible inference"""
         with torch.no_grad():
-            return self.forward(eye_patch, geo_feat, imu_feat)
+            return self.forward(eye_patch, geo_feat)
 
 
 # ─────────────────────────────────────────────
@@ -262,7 +251,6 @@ class NeuralCorrectionPipeline:
         self,
         eye_patch_np: np.ndarray,       # (32, 32) float32 [0, 1]
         geo_feat_np: np.ndarray,         # (12,) float32
-        imu_feat_np: np.ndarray,         # (6,) float32
         raw_gaze_np: np.ndarray,         # (5,) [az, el, conf, vor, eyelid]
     ) -> dict:
         """
@@ -276,20 +264,21 @@ class NeuralCorrectionPipeline:
         # Build tensors
         patch = torch.from_numpy(eye_patch_np).float().unsqueeze(0).unsqueeze(0).to(self.device)
         geo   = torch.from_numpy(geo_feat_np).float().unsqueeze(0).to(self.device)
-        imu   = torch.from_numpy(imu_feat_np).float().unsqueeze(0).to(self.device)
         gaze  = torch.from_numpy(raw_gaze_np).float().unsqueeze(0).to(self.device)
 
         # Residual correction
-        delta = self.corrector(patch, geo, imu)  # (1, 2)
+        delta = self.corrector(patch, geo)  # (1, 2)
 
         # Apply correction to raw gaze
         raw_az, raw_el = raw_gaze_np[0], raw_gaze_np[1]
-        corrected = np.array([raw_az + delta[0, 0].item(),
-                               raw_el + delta[0, 1].item()])
+        # delta is a torch tensor on device; bring to CPU numpy for arithmetic
+        delta_np = delta[0].cpu().numpy()
+        corrected_az = float(raw_az + float(delta_np[0]))
+        corrected_el = float(raw_el + float(delta_np[1]))
 
-        # Update gaze with corrected values for temporal model
-        gaze[0, 0] = corrected[0]
-        gaze[0, 1] = corrected[1]
+        # Update gaze with corrected values for temporal model (assign Python floats)
+        gaze[0, 0] = corrected_az
+        gaze[0, 1] = corrected_el
 
         # Temporal step
         smoothed, velocity, self.hidden = self.temporal.step(gaze, self.hidden)
@@ -300,7 +289,7 @@ class NeuralCorrectionPipeline:
         eye_class = int(logits.argmax(dim=1).item())
 
         return {
-            "corrected_gaze": corrected,
+            "corrected_gaze": np.array([corrected_az, corrected_el]),
             "smoothed_gaze": smoothed[0].cpu().numpy(),
             "velocity": velocity[0].cpu().numpy(),
             "eye_class": eye_class,

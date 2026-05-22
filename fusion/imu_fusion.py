@@ -45,6 +45,8 @@ class WorldGaze:
     gaze_dir_head: np.ndarray     # (3,) unit vector in head frame
     head_pose: HeadPose
     vor_mismatch: float           # magnitude of VOR violation
+    eye_velocity: np.ndarray      # (3,) rad/s estimated from gaze motion
+    vor_error: np.ndarray         # (3,) rad/s error vector
     confidence: float
 
 
@@ -213,10 +215,10 @@ class VORAnalyzer:
         self.gaze_history.append(gaze_dir_head.copy())
         self.head_omega_history.append(head_omega.copy())
 
-    def compute_vor_mismatch(self) -> float:
-        """Returns VOR mismatch [0, ∞) — higher = worse VOR"""
+    def compute_vor_stats(self):
+        """Returns VOR stats: (mismatch, vor_error, eye_velocity)."""
         if len(self.gaze_history) < 3:
-            return 0.0
+            return 0.0, np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
 
         # Estimate eye angular velocity from gaze direction changes
         gazes = np.array(list(self.gaze_history))      # (N, 3)
@@ -229,13 +231,13 @@ class VORAnalyzer:
 
         omega_head_mag = np.linalg.norm(head_omega_mean)
         if omega_head_mag < 0.01:  # < ~0.5 deg/s: no meaningful head movement
-            return 0.0
+            return 0.0, np.zeros(3, dtype=np.float32), gaze_omega_mean
 
         # Expected: gaze should counter-rotate = -omega_head (VOR)
         vor_expected = -head_omega_mean
         vor_error = gaze_omega_mean - vor_expected
         mismatch = np.linalg.norm(vor_error) / omega_head_mag
-        return float(np.clip(mismatch, 0.0, 10.0))
+        return float(np.clip(mismatch, 0.0, 10.0)), vor_error.astype(np.float32), gaze_omega_mean.astype(np.float32)
 
 
 class IMUFusionModule:
@@ -304,7 +306,7 @@ class IMUFusionModule:
 
         # VOR analysis
         self.vor_analyzer.update(gaze_head, self.last_head_pose.angular_velocity)
-        vor_mismatch = self.vor_analyzer.compute_vor_mismatch()
+        vor_mismatch, vor_error, eye_velocity = self.vor_analyzer.compute_vor_stats()
 
         return WorldGaze(
             timestamp=timestamp,
@@ -312,6 +314,8 @@ class IMUFusionModule:
             gaze_dir_head=gaze_head,
             head_pose=self.last_head_pose,
             vor_mismatch=vor_mismatch,
+            eye_velocity=eye_velocity,
+            vor_error=vor_error,
             confidence=gaze_ray.confidence,
         )
 

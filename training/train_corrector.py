@@ -304,7 +304,6 @@ class CorrectorTrainer:
 
         self.model = GazeResidualCorrector(
             geo_dim=cfg.get("geo_dim", 12),
-            imu_dim=cfg.get("imu_dim", 6),
         ).to(self.device)
 
         self.criterion = HuberGazeLoss(
@@ -338,13 +337,12 @@ class CorrectorTrainer:
         for batch in loader:
             patch    = batch["patch"].to(self.device)     # (B, 1, 32, 32)
             geo      = batch["geo"].to(self.device)        # (B, 12)
-            imu      = batch["imu"].to(self.device)        # (B, 6)
             raw_gaze = batch["raw_gaze"].to(self.device)   # (B, 2)
             gt_gaze  = batch["gt_gaze"].to(self.device)    # (B, 2)
 
             self.optimizer.zero_grad()
 
-            pred_delta = self.model(patch, geo, imu)      # (B, 2)
+            pred_delta = self.model(patch, geo)      # (B, 2)
             loss, metrics = self.criterion(pred_delta, raw_gaze, gt_gaze)
 
             loss.backward()

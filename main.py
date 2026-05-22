@@ -40,6 +40,9 @@ class GazeOutput:
     # Research metrics
     eye_class: str              # fixation / saccade / pursuit / blink
     vor_mismatch: float
+    head_velocity: np.ndarray   # rad/s in head frame
+    eye_velocity: np.ndarray    # rad/s estimated from gaze motion
+    vor_error: np.ndarray       # error vector in rad/s
     rdi: float
     rdi_level: str
 
@@ -243,6 +246,9 @@ class GazeTrackingPipeline:
             el = float(np.degrees(np.arctan2(gaze_ray.visual_axis[1],
                                               gaze_ray.visual_axis[2])))
             vor_mismatch = 0.0
+            head_velocity = np.zeros(3, dtype=np.float32)
+            eye_velocity = np.zeros(3, dtype=np.float32)
+            vor_error = np.zeros(3, dtype=np.float32)
         else:
             self._last_world_gaze = world_gaze
             az = float(np.degrees(np.arctan2(world_gaze.gaze_dir_world[0],
@@ -250,11 +256,13 @@ class GazeTrackingPipeline:
             el = float(np.degrees(np.arctan2(world_gaze.gaze_dir_world[1],
                                               world_gaze.gaze_dir_world[2])))
             vor_mismatch = world_gaze.vor_mismatch
+            head_velocity = np.array(world_gaze.head_pose.angular_velocity, dtype=np.float32)
+            eye_velocity = np.array(world_gaze.eye_velocity, dtype=np.float32)
+            vor_error = np.array(world_gaze.vor_error, dtype=np.float32)
 
         # 4. Build neural correction features
         eye_patch = self._extract_patch(frame, eye_features)
         geo_feat  = self._build_geo_features(eye_features)
-        imu_feat  = self._build_imu_features(world_gaze)
         raw_gaze_arr = np.array([az, el,
                                   eye_features.pupil.confidence if eye_features.pupil else 0.0,
                                   vor_mismatch,
@@ -262,7 +270,7 @@ class GazeTrackingPipeline:
 
         # 5. Neural correction + temporal (~2-4ms)
         nn_result = self.neural_pipeline.process(
-            eye_patch, geo_feat, imu_feat, raw_gaze_arr
+            eye_patch, geo_feat, raw_gaze_arr
         )
 
         smoothed_az = float(nn_result["smoothed_gaze"][0])
@@ -307,6 +315,9 @@ class GazeTrackingPipeline:
             gaze_confidence=float(gaze_ray.confidence),
             eye_class=eye_class,
             vor_mismatch=vor_mismatch,
+            head_velocity=head_velocity,
+            eye_velocity=eye_velocity,
+            vor_error=vor_error,
             rdi=self._last_rdi,
             rdi_level=self._last_rdi_level,
             gazed_object_label=None,
@@ -351,18 +362,6 @@ class GazeTrackingPipeline:
                 if features.glints.valid_mask[i]:
                     feat[4 + i*2]   = features.glints.centers[i, 0] / 640.0
                     feat[4 + i*2+1] = features.glints.centers[i, 1] / 480.0
-        return feat
-
-    def _build_imu_features(self, world_gaze: Optional[WorldGaze]) -> np.ndarray:
-        """Build 6-dim IMU feature vector"""
-        feat = np.zeros(6, dtype=np.float32)
-        if world_gaze is not None and world_gaze.head_pose is not None:
-            euler = world_gaze.head_pose.euler
-            omega = world_gaze.head_pose.angular_velocity
-            feat[0] = float(np.sin(np.deg2rad(euler[0])))  # roll sin
-            feat[1] = float(np.sin(np.deg2rad(euler[1])))  # pitch sin
-            feat[2] = float(np.sin(np.deg2rad(euler[2])))  # yaw sin
-            feat[3:6] = np.clip(omega / 10.0, -1.0, 1.0)  # angular vel normalized
         return feat
 
     def get_latency_stats(self) -> dict:
@@ -454,28 +453,42 @@ if __name__ == "__main__":
 
     print("Pipeline initialized...")
 
-    # Dummy loop (simulate camera input)
-    for i in range(20):
-        dummy_eye = np.zeros((240, 320, 3), dtype=np.uint8)
-        timestamp = time.time()
+    cap = cv2.VideoCapture(1)
+    if not cap.isOpened():
+        logger.error("Could not open webcam. Exiting.")
+        pipeline.stop()
+        raise SystemExit(1)
 
-        pipeline.push_eye_frame(dummy_eye, timestamp)
+    print("Press ESC to stop.")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Webcam frame not available. Exiting.")
+                break
 
-        # Fake IMU data
-        imu_sample = IMUSample(
-            timestamp=timestamp,
-            accel=np.zeros(3),
-            gyro=np.zeros(3)
-        )
-        pipeline.push_imu_sample(imu_sample)
+            timestamp = time.time()
+            pipeline.push_eye_frame(frame, timestamp)
 
-        # Read output
-        output = pipeline.get_output()
+            imu_sample = IMUSample(
+                timestamp=timestamp,
+                accel=np.zeros(3),
+                gyro=np.zeros(3)
+            )
+            pipeline.push_imu_sample(imu_sample)
 
-        if output:
-            print(f"[Frame {output.frame_id}] Gaze: ({output.gaze_az_deg:.2f}, {output.gaze_el_deg:.2f}) | RDI: {output.rdi:.3f}")
+            output = pipeline.get_output(timeout=0.05)
+            if output:
+                print(
+                    f"[Frame {output.frame_id}] Gaze: ({output.gaze_az_deg:.2f}, {output.gaze_el_deg:.2f}) "
+                    f"| RDI: {output.rdi:.3f} | VOR mismatch: {output.vor_mismatch:.3f}"
+                )
 
-        time.sleep(0.03)
-
-    pipeline.stop()
-    print("Pipeline stopped.")
+            cv2.imshow("Eye Camera", frame)
+            if cv2.waitKey(1) == 27:
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        pipeline.stop()
+        print("Pipeline stopped.")
